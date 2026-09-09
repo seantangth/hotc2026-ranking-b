@@ -1,0 +1,83 @@
+# Ranking B delivery environment — pinned 2026-08-28
+#
+# 🚨 08-30 (D097) UPDATE — READ THIS FIRST
+# ---------------------------------------------------------------------------
+# The chain is bit-deterministic: 3 executions x 2 machines x 2 package sets all
+# produced md5-identical submissions (08-30). Determinism proved robust even to
+# patch upgrades of timm / hydra-core / cuda-pathfinder -- an earlier claim that
+# those upgrades cost ~0.01 LB was REFUTED by run F the same day; do not repeat it.
+# Pin anyway, for exact reconstructability rather than score protection: fully
+# resolved locks live in 3_src/env_locks/ (see its README).
+# Verified on NVIDIA A10 only; cross-architecture bit-identity is untested.
+# ---------------------------------------------------------------------------
+#
+# Closes D052(d), open since 08-07 ("全專案無 requirements/lock/Dockerfile").
+# Every pin below is either a hard requirement discovered by running on a clean
+# box, or a provenance anchor. Two of them were found on 08-28 and would have
+# broken the 9/7 cold start in exactly the same way.
+#
+# Two isolated venvs are required (D-lesson: --system-site-packages lets pip be
+# satisfied by apt packages and old C extensions then break on numpy 2.x ABI):
+#   t1env   : SAMURAI / SAM2.1 leg
+#   sam3env : SAM3 leg
+# Install torch first in both, then the leg-specific packages.
+
+# ---------------------------------------------------------------------------
+# 🚨 setuptools: MUST be < 81
+# ---------------------------------------------------------------------------
+# setuptools 81 removed pkg_resources, and sam3/model_builder.py imports it at
+# module scope -> `import sam3` dies with ModuleNotFoundError on any clean box
+# that resolves a current setuptools. The 08-27 405-sequence run only worked
+# because it happened to resolve an older one; the 08-28 box resolved 84.0.0 and
+# failed immediately. This is not a nice-to-have.
+setuptools<81
+
+# ---------------------------------------------------------------------------
+# sam3 leg
+# ---------------------------------------------------------------------------
+# Pinned to the SHA every measured result was produced with.
+# sam3 @ git+https://github.com/facebookresearch/sam3.git@96914d2425f90a64f45ca977c2b5165418099543
+#
+# The published package does NOT declare these, yet `import sam3` needs them all
+# (found by installing on a clean box and resolving the ImportError chain:
+# einops -> pycocotools -> psutil). Adding "[train]" extras does not help.
+einops
+pycocotools
+psutil
+hydra-core
+iopath
+timm
+tqdm
+pillow
+numpy
+pandas
+
+# ---------------------------------------------------------------------------
+# t1env (SAMURAI / SAM2.1) leg
+# ---------------------------------------------------------------------------
+# SAMURAI fork, pinned:
+#   git+https://github.com/yangchris11/samurai.git@76ba195984892b0d1e3db5d9c9f90bb62175680a
+#   then `pip install -e <clone>/sam2`
+scipy
+loguru
+opencv-python-headless
+
+# ---------------------------------------------------------------------------
+# Model weights (not pip-installable; verify by hash, never by size alone)
+# ---------------------------------------------------------------------------
+# SAM3   : https://huggingface.co/facebook/sam3/resolve/main/sam3.pt   (gated)
+#          sha256 9999e2341ceef5e136daa386eecb55cb414446a00ac2b55eb2dfd2f7c3cf8c9e
+#          Requires HF_TOKEN with approved access. The 1038lab mirror used
+#          before 08-27 is byte-identical (same sha256), but the official URL is
+#          what the delivery must reference.
+# SAM2.1 : sam2.1_hiera_large.pt
+#          sha256 2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318
+#
+# ---------------------------------------------------------------------------
+# Torch
+# ---------------------------------------------------------------------------
+# Installed via `uv pip install torch torchvision --torch-backend=auto` so the
+# CUDA build matches the host driver. Observed on the measured runs: 2.13.0+cu129.
+# Not hard-pinned: a driver mismatch is a worse failure than a minor version
+# drift, and D074 already established that cross-machine bit-exactness is not
+# attainable regardless.

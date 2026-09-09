@@ -1,0 +1,1022 @@
+
+===== CELL 0 (markdown) =====
+# 1. Setup
+
+===== CELL 1 (code) =====
+!nvidia-smi
+
+===== CELL 2 (code) =====
+!pip install -q "gdown>=6.1"
+
+===== CELL 3 (code) =====
+from pathlib import Path
+from zipfile import ZipFile
+from urllib.parse import urlparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json, random, subprocess, requests, cv2, numpy as np, pandas as pd, torch
+from tqdm.auto import tqdm
+
+SEED = 42
+COMPETITION_DIR = Path("/kaggle/input/competitions/hyperspectral-object-tracking-challenge-2026")
+WORK_DIR = Path("/kaggle/working")
+CACHE_DIR = Path("/kaggle/temp/hotc2026")
+MANIFEST_PATH = CACHE_DIR / "drive_manifest.json"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.benchmark = torch.cuda.is_available()
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+N_GPUS = torch.cuda.device_count()
+
+print(f"Python | PyTorch {torch.__version__} | CUDA {torch.version.cuda} | GPUs {N_GPUS}")
+for index in range(N_GPUS):
+    properties = torch.cuda.get_device_properties(index)
+    print(f"GPU {index}: {torch.cuda.get_device_name(index)} | {properties.total_memory / 1024**3:.1f} GB")
+
+===== CELL 4 (code) =====
+def parse_ids(table):
+    table = table.copy()
+    parts = table["ID"].str.rsplit("_", n=1, expand=True)
+    table["sequence"] = parts[0]
+    table["frame"] = parts[1].astype(int)
+    table["sensor"] = table["sequence"].str.split("-", n=1).str[0].str.lower()
+    table["target"] = table["sequence"].str.split("-", n=1).str[1]
+    return table
+
+train = parse_ids(pd.read_csv(COMPETITION_DIR / "2026training.csv"))
+submission_template = pd.read_csv(COMPETITION_DIR / "sample_submisson.csv")
+test = parse_ids(submission_template)
+
+print(f"Training: {len(train):,} frames, {train['sequence'].nunique()} sequences")
+print(f"Submission: {len(test):,} frames, {test['sequence'].nunique()} sequences")
+print("Bounding-box format: top-left x, top-left y, width, height")
+
+===== CELL 5 (code) =====
+DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1heJqpBgq42GpbH8y5TFF5IreE5lceqiW"
+MANIFEST_LOG = CACHE_DIR / "drive_manifest.log"
+
+if not MANIFEST_PATH.exists():
+    print("Loading public Drive manifest...")
+    with MANIFEST_PATH.open("w") as output, MANIFEST_LOG.open("w") as error:
+        subprocess.run(["gdown", DRIVE_FOLDER_URL, "--folder", "--json", "--quiet", "--no-cookies"], stdout=output, stderr=error, check=True)
+
+with MANIFEST_PATH.open() as file:
+    drive_items = json.load(file)
+
+raw_paths = [Path(item["path"]) for item in drive_items]
+root_name = raw_paths[0].parts[0] if raw_paths and len({path.parts[0] for path in raw_paths}) == 1 else None
+relative_paths = [Path(*path.parts[1:]) if root_name else path for path in raw_paths]
+
+drive_manifest = pd.DataFrame({"path": [str(path) for path in relative_paths], "url": [item["url"] for item in drive_items]})
+path_parts = drive_manifest["path"].str.split("/")
+drive_manifest["split"] = path_parts.str[0]
+drive_manifest["folder"] = path_parts.str[1]
+drive_manifest["extension"] = drive_manifest["path"].map(lambda path: Path(path).suffix.lower())
+url_by_path = dict(zip(drive_manifest["path"], drive_manifest["url"]))
+
+print(f"Drive manifest: {len(drive_manifest):,} files")
+display(drive_manifest.groupby("split").size().rename("files").to_frame())
+
+===== CELL 6 (code) =====
+TRAIN_HSI_FOLDERS = {"nir": "HSI-NIR", "rednir": "HSI-RedNIR", "vis": "HSI-VIS"}
+TRAIN_COLOR_FOLDERS = {"nir": "HSI-NIR-FalseColor", "rednir": "HSI-RedNIR-FalseColor", "vis": "HSI-VIS-FalseColor_25"}
+TEST_HSI_FOLDERS = {"nir": "HSI-NIR", "rednir": "HSI-RedNIR", "vis": "HSI-VIS"}
+TEST_COLOR_FOLDERS = {"nir": "HSI-NIR-FalseColor", "rednir": "HSI-RedNIR-FalseColor", "vis": "HSI-VIS-FalseColor"}
+
+update_archives = drive_manifest[(drive_manifest["split"] == "training") & (drive_manifest["folder"] == "update")].copy()
+update_parts = update_archives["path"].str.split("/")
+update_archives["data_folder"] = update_parts.str[2].replace({"HSI-VIS-FalseColor": "HSI-VIS-FalseColor_25"})
+update_archives["archive_name"] = update_archives["path"].map(lambda path: Path(path).name)
+update_lookup = dict(zip(update_archives["data_folder"] + "/" + update_archives["archive_name"], update_archives["path"]))
+
+def resolve_training_archive(sequence, modality):
+    sensor, target = sequence.split("-", 1)
+    folder = (TRAIN_HSI_FOLDERS if modality == "hsi" else TRAIN_COLOR_FOLDERS)[sensor]
+    canonical_path = f"training/{folder}/{target}.zip"
+    return update_lookup.get(f"{folder}/{target}.zip", canonical_path)
+
+def resolve_test_source(sequence, modality, frame=None):
+    sensor, target = sequence.split("-", 1)
+    if modality == "color":
+        return f"validation/{TEST_COLOR_FOLDERS[sensor]}/{target}/{frame:04d}.jpg"
+    if sensor == "vis":
+        return f"validation/{TEST_HSI_FOLDERS[sensor]}/{target}.zip"
+    return f"validation/{TEST_HSI_FOLDERS[sensor]}/{target}/{frame:04d}.png"
+
+def resolve_test_initialization(sequence):
+    sensor, target = sequence.split("-", 1)
+    return f"validation/{TEST_COLOR_FOLDERS[sensor]}/{target}/init_rect.txt"
+
+===== CELL 7 (code) =====
+def direct_drive_url(remote_path):
+    file_id = parse_qs(urlparse(url_by_path[remote_path]).query)["id"][0]
+    return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+
+def download_drive_file(remote_path, local_path):
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_path.exists():
+        return local_path
+
+    temporary_path = local_path.with_suffix(local_path.suffix + ".part")
+    with requests.get(direct_drive_url(remote_path), stream=True, timeout=(15, 180)) as response:
+        response.raise_for_status()
+        if "text/html" in response.headers.get("content-type", ""):
+            raise RuntimeError(f"Drive returned an error page for {remote_path}")
+        with temporary_path.open("wb") as file:
+            for chunk in response.iter_content(chunk_size=4 * 1024**2):
+                if chunk:
+                    file.write(chunk)
+
+    temporary_path.replace(local_path)
+    return local_path
+
+def download_many(jobs, workers=16, description="Downloading"):
+    records = jobs[["remote_path", "local_path"]].to_dict("records")
+    if not records:
+        return pd.DataFrame(columns=["remote_path", "error"])
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=min(workers, len(records))) as pool:
+        futures = {pool.submit(download_drive_file, job["remote_path"], job["local_path"]): job for job in records}
+        for future in tqdm(as_completed(futures), total=len(futures), desc=description):
+            job = futures[future]
+            try:
+                future.result()
+            except Exception as error:
+                errors.append({"remote_path": job["remote_path"], "error": str(error).splitlines()[0]})
+
+    print(f"Completed: {len(records) - len(errors):,}/{len(records):,}")
+    return pd.DataFrame(errors)
+
+===== CELL 8 (code) =====
+MOSAIC_PATTERNS = {"nir": (5, 5), "rednir": (4, 4), "vis": (4, 4)}
+
+def mosaic_to_cube(image, sensor):
+    pattern_h, pattern_w = MOSAIC_PATTERNS[sensor]
+    height = image.shape[0] // pattern_h * pattern_h
+    width = image.shape[1] // pattern_w * pattern_w
+    image = image[:height, :width]
+    return image.reshape(height // pattern_h, pattern_h, width // pattern_w, pattern_w).transpose(0, 2, 1, 3).reshape(height // pattern_h, width // pattern_w, pattern_h * pattern_w)
+
+===== CELL 9 (code) =====
+training_sources = []
+for sequence in train["sequence"].drop_duplicates():
+    training_sources.append(resolve_training_archive(sequence, "hsi"))
+    training_sources.append(resolve_training_archive(sequence, "color"))
+
+test_color_sources = [resolve_test_source(row.sequence, "color", row.frame) for row in test.itertuples()]
+test_hsi_sources = {resolve_test_source(row.sequence, "hsi", row.frame) for row in test.itertuples()}
+initialization_sources = {resolve_test_initialization(sequence) for sequence in test["sequence"].unique()}
+
+print(f"Training archives available: {sum(path in url_by_path for path in training_sources)}/{len(training_sources)}")
+print(f"Submission color frames available: {sum(path in url_by_path for path in test_color_sources)}/{len(test_color_sources)}")
+print(f"Submission HSI sources available: {sum(path in url_by_path for path in test_hsi_sources)}/{len(test_hsi_sources)}")
+print(f"Initialization files available: {sum(path in url_by_path for path in initialization_sources)}/{len(initialization_sources)}")
+
+===== CELL 10 (markdown) =====
+# 2. Data analysis
+
+===== CELL 11 (code) =====
+tracks = train.sort_values(["sequence", "frame"]).copy()
+tracks["center_x"] = tracks["x"] + tracks["width"] / 2
+tracks["center_y"] = tracks["y"] + tracks["height"] / 2
+tracks["box_area"] = tracks["width"] * tracks["height"]
+tracks["center_motion"] = np.hypot(tracks.groupby("sequence")["center_x"].diff(), tracks.groupby("sequence")["center_y"].diff())
+tracks["relative_motion"] = tracks["center_motion"] / np.sqrt(tracks["box_area"].clip(lower=1))
+tracks["scale_change"] = np.log(tracks["box_area"].clip(lower=1)).groupby(tracks["sequence"]).diff().abs()
+
+sequence_stats = tracks.groupby(["sensor", "sequence"], as_index=False).agg(frames=("frame", "size"), median_box_area=("box_area", "median"), motion_p90=("relative_motion", lambda values: values.quantile(.9)), scale_p90=("scale_change", lambda values: values.quantile(.9)))
+sensor_summary = sequence_stats.groupby("sensor").agg(sequences=("sequence", "size"), frames=("frames", "sum"), shortest_sequence=("frames", "min"), median_sequence=("frames", "median"), longest_sequence=("frames", "max"))
+sensor_summary = sensor_summary.join(tracks.groupby("sensor").agg(median_width=("width", "median"), median_height=("height", "median"), median_box_area=("box_area", "median")))
+
+box_quantiles = tracks.groupby("sensor")["box_area"].quantile([.01, .1, .5, .9, .99]).unstack()
+box_quantiles.columns = ["p01", "p10", "p50", "p90", "p99"]
+
+display(sensor_summary.round(1))
+display(box_quantiles.round(1))
+
+===== CELL 12 (code) =====
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+for sensor, group in sequence_stats.groupby("sensor"):
+    axes[0].hist(group["frames"], bins=30, alpha=.55, label=sensor.upper())
+
+for sensor, group in tracks.groupby("sensor"):
+    axes[1].hist(np.log10(group["box_area"].clip(lower=1)), bins=40, alpha=.55, label=sensor.upper())
+
+axes[0].set(title="Sequence lengths", xlabel="Frames", ylabel="Sequences")
+axes[1].set(title="Target box areas", xlabel="log10(box area in pixels)", ylabel="Frames")
+axes[0].legend(); axes[1].legend()
+plt.tight_layout()
+plt.show()
+
+===== CELL 13 (code) =====
+EDA_DIR = CACHE_DIR / "eda"
+eda_rows = []
+
+for sequence in ("nir-bracelet", "rednir-duck5", "vis-bus"):
+    remote_path = resolve_training_archive(sequence, "color")
+    eda_rows.append({"kind": "training_color", "sequence": sequence, "remote_path": remote_path, "local_path": EDA_DIR / "training" / f"{sequence}__color.zip"})
+
+remote_path = resolve_training_archive("vis-bus", "hsi")
+eda_rows.append({"kind": "training_hsi", "sequence": "vis-bus", "remote_path": remote_path, "local_path": EDA_DIR / "training" / "vis-bus__hsi.zip"})
+
+for sequence in ("nir-bee2", "rednir-bee1"):
+    for modality in ("hsi", "color"):
+        remote_path = resolve_test_source(sequence, modality, 1)
+        eda_rows.append({"kind": f"sensor_{modality}", "sequence": sequence, "remote_path": remote_path, "local_path": EDA_DIR / "sensor_frames" / f"{sequence}__{modality}{Path(remote_path).suffix}"})
+    remote_path = resolve_test_initialization(sequence)
+    eda_rows.append({"kind": "initialization", "sequence": sequence, "remote_path": remote_path, "local_path": EDA_DIR / "sensor_frames" / f"{sequence}__init.txt"})
+
+eda_jobs = pd.DataFrame(eda_rows)
+display(eda_jobs[["kind", "sequence", "remote_path"]])
+
+===== CELL 14 (code) =====
+download_errors = download_many(eda_jobs, workers=4, description="Downloading EDA sample")
+eda_jobs["size_mb"] = [Path(path).stat().st_size / 1024**2 if Path(path).exists() else np.nan for path in eda_jobs["local_path"]]
+
+display(eda_jobs.groupby("kind")["size_mb"].agg(files="count", total_mb="sum").round(2))
+print(f"Total downloaded: {eda_jobs['size_mb'].sum():.1f} MB")
+if not download_errors.empty:
+    display(download_errors)
+
+===== CELL 15 (code) =====
+from matplotlib.patches import Rectangle
+
+color_archive_paths = {}
+for row in eda_jobs[eda_jobs["kind"] == "training_color"].itertuples(index=False):
+    color_archive_paths[row.sequence] = Path(row.local_path)
+
+temporal_sequences = {}
+archive_summary = []
+
+for sequence, archive_path in color_archive_paths.items():
+    with ZipFile(archive_path) as archive:
+        frame_names = sorted(member.filename for member in archive.infolist() if Path(member.filename).suffix.lower() == ".jpg")
+        text_names = [member.filename for member in archive.infolist() if Path(member.filename).suffix.lower() == ".txt"]
+        annotation_name = next(name for name in text_names if "groundtruth" in Path(name).name.lower())
+        archive_boxes = np.atleast_2d(np.loadtxt(archive.open(annotation_name)))
+        first_image = cv2.imdecode(np.frombuffer(archive.read(frame_names[0]), np.uint8), cv2.IMREAD_COLOR)
+
+    csv_boxes = train[train["sequence"] == sequence].sort_values("frame")[["x", "y", "width", "height"]].to_numpy()
+    height, width = first_image.shape[:2]
+    outside = (csv_boxes[:, 0] < 0) | (csv_boxes[:, 1] < 0) | (csv_boxes[:, 0] + csv_boxes[:, 2] > width) | (csv_boxes[:, 1] + csv_boxes[:, 3] > height)
+    temporal_sequences[sequence] = {"archive_path": archive_path, "frame_names": frame_names, "text_names": text_names}
+    archive_summary.append({"sequence": sequence, "resolution": f"{width}×{height}", "archive_frames": len(frame_names), "csv_frames": len(csv_boxes), "annotations_match": archive_boxes.shape == csv_boxes.shape and np.allclose(archive_boxes, csv_boxes), "outside_rate": outside.mean() * 100})
+
+display(pd.DataFrame(archive_summary).round(2))
+
+===== CELL 16 (code) =====
+sequence_order = ["nir-bracelet", "rednir-duck5", "vis-bus"]
+fig, axes = plt.subplots(len(sequence_order), 3, figsize=(14, 10))
+
+for row_index, sequence in enumerate(sequence_order):
+    sample = temporal_sequences[sequence]
+    labels = train[train["sequence"] == sequence].sort_values("frame").reset_index(drop=True)
+    positions = [0, len(sample["frame_names"]) // 2, len(sample["frame_names"]) - 1]
+
+    with ZipFile(sample["archive_path"]) as archive:
+        for column_index, position in enumerate(positions):
+            frame_name = sample["frame_names"][position]
+            image = cv2.cvtColor(cv2.imdecode(np.frombuffer(archive.read(frame_name), np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+            box = labels.iloc[position]
+            axis = axes[row_index, column_index]
+            axis.imshow(image)
+            axis.add_patch(Rectangle((box["x"], box["y"]), box["width"], box["height"], fill=False, edgecolor="lime", linewidth=2))
+            axis.set_title(f"{sequence} · frame {box['frame']}")
+            axis.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+===== CELL 17 (code) =====
+def parse_ids(table):
+    table = table.copy()
+    parts = table["ID"].str.rsplit("_", n=1, expand=True)
+    table["sequence"] = parts[0]
+    table["id_number"] = parts[1].astype(int)
+    table["frame"] = table.groupby("sequence").cumcount() + 1
+    table["sensor"] = table["sequence"].str.split("-", n=1).str[0].str.lower()
+    table["target"] = table["sequence"].str.split("-", n=1).str[1]
+    return table
+
+train = parse_ids(pd.read_csv(COMPETITION_DIR / "2026training.csv"))
+submission_template = pd.read_csv(COMPETITION_DIR / "sample_submisson.csv")
+test = parse_ids(submission_template)
+
+===== CELL 18 (code) =====
+def resolve_test_source(sequence, modality, file_number=None):
+    sensor, target = sequence.split("-", 1)
+    if modality == "color":
+        return f"validation/{TEST_COLOR_FOLDERS[sensor]}/{target}/{file_number:04d}.jpg"
+    if sensor == "vis":
+        return f"validation/{TEST_HSI_FOLDERS[sensor]}/{target}.zip"
+    return f"validation/{TEST_HSI_FOLDERS[sensor]}/{target}/{file_number:04d}.png"
+
+===== CELL 19 (code) =====
+test_color_sources = [resolve_test_source(row.sequence, "color", row.id_number) for row in test.itertuples()]
+test_hsi_sources = {resolve_test_source(row.sequence, "hsi", row.id_number) for row in test.itertuples()}
+
+===== CELL 20 (code) =====
+def eda_path(kind, sequence):
+    return Path(eda_jobs.loc[(eda_jobs["kind"] == kind) & (eda_jobs["sequence"] == sequence), "local_path"].iloc[0])
+
+def first_zip_image(archive_path, extension, flags):
+    with ZipFile(archive_path) as archive:
+        image_name = sorted(member.filename for member in archive.infolist() if Path(member.filename).suffix.lower() == extension)[0]
+        return cv2.imdecode(np.frombuffer(archive.read(image_name), np.uint8), flags)
+
+sensor_samples = {}
+
+vis_raw = first_zip_image(eda_path("training_hsi", "vis-bus"), ".png", cv2.IMREAD_UNCHANGED)
+vis_color = cv2.cvtColor(first_zip_image(eda_path("training_color", "vis-bus"), ".jpg", cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+vis_box = train[train["sequence"] == "vis-bus"].sort_values("frame").iloc[0][["x", "y", "width", "height"]].to_numpy(dtype=float)
+sensor_samples["vis"] = {"raw": vis_raw, "color": vis_color, "box": vis_box}
+
+for sensor, sequence in (("nir", "nir-bee2"), ("rednir", "rednir-bee1")):
+    raw = cv2.imread(str(eda_path("sensor_hsi", sequence)), cv2.IMREAD_UNCHANGED)
+    color = cv2.cvtColor(cv2.imread(str(eda_path("sensor_color", sequence)), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    box = np.loadtxt(eda_path("initialization", sequence)).reshape(-1)[:4]
+    sensor_samples[sensor] = {"raw": raw, "color": color, "box": box}
+
+spectral_summary = []
+for sensor, sample in sensor_samples.items():
+    sample["cube"] = mosaic_to_cube(sample["raw"], sensor)
+    cube = sample["cube"]
+    spectral_summary.append({"sensor": sensor, "raw_shape": sample["raw"].shape, "cube_shape": cube.shape, "color_shape": sample["color"].shape, "bands": cube.shape[-1], "median": np.median(cube), "p99": np.percentile(cube, 99), "maximum": cube.max(), "zero_fraction": np.mean(cube == 0)})
+
+display(pd.DataFrame(spectral_summary).round(3))
+
+===== CELL 21 (code) =====
+def target_context_profiles(cube, box):
+    height, width, bands = cube.shape
+    x, y, box_width, box_height = box
+    x1 = int(np.clip(round(x), 0, width - 1)); y1 = int(np.clip(round(y), 0, height - 1))
+    x2 = int(np.clip(round(x + box_width), x1 + 1, width)); y2 = int(np.clip(round(y + box_height), y1 + 1, height))
+    margin_x = max(int(round(box_width)), 4); margin_y = max(int(round(box_height)), 4)
+    context_x1 = max(0, x1 - margin_x); context_y1 = max(0, y1 - margin_y)
+    context_x2 = min(width, x2 + margin_x); context_y2 = min(height, y2 + margin_y)
+
+    target_pixels = cube[y1:y2, x1:x2].reshape(-1, bands)
+    context_crop = cube[context_y1:context_y2, context_x1:context_x2]
+    context_mask = np.ones(context_crop.shape[:2], dtype=bool)
+    context_mask[y1 - context_y1:y2 - context_y1, x1 - context_x1:x2 - context_x1] = False
+    context_pixels = context_crop[context_mask]
+
+    target_profile = target_pixels.mean(axis=0)
+    context_profile = context_pixels.mean(axis=0)
+    target_profile /= target_profile.mean() + 1e-6
+    context_profile /= context_profile.mean() + 1e-6
+    return target_profile, context_profile
+
+===== CELL 22 (code) =====
+profile_rows = []
+fig, axes = plt.subplots(3, 2, figsize=(13, 12))
+
+for row_index, sensor in enumerate(("nir", "rednir", "vis")):
+    sample = sensor_samples[sensor]
+    target_profile, context_profile = target_context_profiles(sample["cube"], sample["box"])
+    x, y, width, height = sample["box"]
+
+    axes[row_index, 0].imshow(sample["color"])
+    axes[row_index, 0].add_patch(Rectangle((x, y), width, height, fill=False, edgecolor="lime", linewidth=2))
+    axes[row_index, 0].set_title(f"{sensor.upper()} target")
+    axes[row_index, 0].axis("off")
+
+    channels = np.arange(1, len(target_profile) + 1)
+    axes[row_index, 1].plot(channels, target_profile, marker="o", label="Target")
+    axes[row_index, 1].plot(channels, context_profile, marker="o", label="Local context")
+    axes[row_index, 1].set(title=f"{sensor.upper()} relative spectral response", xlabel="Channel", ylabel="Response / channel mean")
+    axes[row_index, 1].legend()
+    profile_rows.append({"sensor": sensor, "channels": len(target_profile), "mean_profile_difference": np.mean(np.abs(target_profile - context_profile))})
+
+plt.tight_layout()
+plt.show()
+display(pd.DataFrame(profile_rows).round(3))
+
+===== CELL 23 (markdown) =====
+- The training set contains 169490 frames from 405 video sequences recorded with three different sensors.
+- Many tracked objects are quite small, and some videos contain large changes in movement or object size.
+- The bounding boxes in the CSV match the annotations inside the downloaded archives.
+- Each sensor has a different number of spectral channels and a different range of pixel values, so they should be processed separately.
+- False-color images are a good starting point for tracking, while the hyperspectral data may provide extra information when combined with them.
+
+===== CELL 24 (markdown) =====
+# 3. Experiments
+
+===== CELL 25 (code) =====
+# # Official evaluation metrics
+
+# def box_iou(boxes_a, boxes_b):
+#     left = np.maximum(boxes_a[:, 0], boxes_b[:, 0])
+#     top = np.maximum(boxes_a[:, 1], boxes_b[:, 1])
+#     right = np.minimum(boxes_a[:, 0] + boxes_a[:, 2], boxes_b[:, 0] + boxes_b[:, 2])
+#     bottom = np.minimum(boxes_a[:, 1] + boxes_a[:, 3], boxes_b[:, 1] + boxes_b[:, 3])
+#     intersection = np.maximum(0, right - left) * np.maximum(0, bottom - top)
+#     union = boxes_a[:, 2] * boxes_a[:, 3] + boxes_b[:, 2] * boxes_b[:, 3] - intersection
+#     return intersection / np.maximum(union, 1e-12)
+
+# def tracking_metrics(ground_truth, predictions):
+#     ground_truth = np.asarray(ground_truth, dtype=float)
+#     predictions = np.asarray(predictions, dtype=float)
+#     ground_truth_centers = ground_truth[:, :2] + ground_truth[:, 2:] / 2
+#     prediction_centers = predictions[:, :2] + predictions[:, 2:] / 2
+#     center_distances = np.linalg.norm(ground_truth_centers - prediction_centers, axis=1)
+#     ious = box_iou(ground_truth, predictions)
+#     success_thresholds = np.arange(.02, 1.02, .02)
+#     success_auc = np.mean([(ious >= threshold).mean() for threshold in success_thresholds])
+#     return {"precision_20": (center_distances < 20).mean(), "success_auc": success_auc, "mean_iou": ious.mean(), "center_error": center_distances.mean()}
+
+===== CELL 26 (code) =====
+# EXPERIMENT_SEQUENCES = ["nir-bracelet", "rednir-duck5", "vis-bus"]
+# baseline_rows = []
+
+# for sequence in EXPERIMENT_SEQUENCES:
+#     ground_truth = train[train["sequence"] == sequence].sort_values("frame")[["x", "y", "width", "height"]].to_numpy(dtype=float)
+#     predictions = np.repeat(ground_truth[:1], len(ground_truth), axis=0)
+#     metrics = tracking_metrics(ground_truth, predictions)
+#     baseline_rows.append({"sequence": sequence, "sensor": sequence.split("-", 1)[0], "frames": len(ground_truth), "archive_frames": len(temporal_sequences[sequence]["frame_names"]), **metrics})
+
+# baseline_results = pd.DataFrame(baseline_rows)
+# display(baseline_results.round(3))
+# display(baseline_results[["precision_20", "success_auc", "mean_iou", "center_error"]].mean().rename("Mean").to_frame().T.round(3))
+
+===== CELL 27 (markdown) =====
+## SAMURAI Tracking
+
+https://github.com/yangchris11/samurai
+
+===== CELL 28 (code) =====
+# import os, shutil, subprocess, sys
+
+# SAMURAI_DIR = CACHE_DIR / "samurai"
+# SAMURAI_CHECKPOINT = SAMURAI_DIR / "sam2/checkpoints/sam2.1_hiera_base_plus.pt"
+# SAMURAI_CONFIG = "configs/samurai/sam2.1_hiera_b+.yaml"
+# CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt"
+
+# def run_quiet(command, environment=None):
+#     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
+#     if result.returncode:
+#         print(result.stdout[-5000:])
+#         result.check_returncode()
+
+# if not (SAMURAI_DIR / "scripts/demo.py").exists():
+#     shutil.rmtree(SAMURAI_DIR, ignore_errors=True)
+#     print("Downloading SAMURAI source...")
+#     run_quiet(["git", "clone", "--depth", "1", "https://github.com/yangchris11/samurai.git", str(SAMURAI_DIR)])
+
+# install_marker = SAMURAI_DIR / ".kaggle_installed"
+# if not install_marker.exists():
+#     print("Installing SAMURAI...")
+#     install_environment = os.environ.copy()
+#     install_environment["MAX_JOBS"] = "2"
+#     run_quiet([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "-e", str(SAMURAI_DIR / "sam2")], install_environment)
+#     install_marker.touch()
+
+# def download_file(url, path):
+#     path.parent.mkdir(parents=True, exist_ok=True)
+#     temporary_path = path.with_suffix(path.suffix + ".part")
+#     with requests.get(url, stream=True, timeout=(10, 60)) as response:
+#         response.raise_for_status()
+#         total = int(response.headers.get("content-length", 0))
+#         with open(temporary_path, "wb") as file, tqdm(total=total, unit="B", unit_scale=True, desc=path.name) as progress:
+#             for chunk in response.iter_content(1024 ** 2):
+#                 if chunk:
+#                     file.write(chunk)
+#                     progress.update(len(chunk))
+#     temporary_path.replace(path)
+
+# if not SAMURAI_CHECKPOINT.exists():
+#     download_file(CHECKPOINT_URL, SAMURAI_CHECKPOINT)
+
+# sam2_extension_available = (SAMURAI_DIR / "sam2/sam2/_C.so").exists()
+# print(f"SAMURAI ready | Checkpoint: {SAMURAI_CHECKPOINT.stat().st_size / 1024 ** 2:.1f} MB | CUDA post-processing: {sam2_extension_available}")
+
+===== CELL 29 (code) =====
+# from zipfile import ZipFile
+
+# SAMURAI_FRAME_DIR = CACHE_DIR / "samurai_frames"
+# SAMURAI_FRAME_DIR.mkdir(parents=True, exist_ok=True)
+# samurai_frame_dirs, preparation_rows = {}, []
+# total_frames = sum(len(temporal_sequences[sequence]["frame_names"]) for sequence in EXPERIMENT_SEQUENCES)
+
+# with tqdm(total=total_frames, desc="Preparing frames") as progress:
+#     for sequence in EXPERIMENT_SEQUENCES:
+#         sequence_dir = SAMURAI_FRAME_DIR / sequence
+#         sequence_dir.mkdir(parents=True, exist_ok=True)
+#         frame_names = temporal_sequences[sequence]["frame_names"]
+
+#         with ZipFile(temporal_sequences[sequence]["archive_path"]) as archive:
+#             for frame_index, member_name in enumerate(frame_names):
+#                 output_path = sequence_dir / f"{frame_index:05d}.jpg"
+#                 if not output_path.exists():
+#                     output_path.write_bytes(archive.read(member_name))
+#                 progress.update(1)
+
+#         samurai_frame_dirs[sequence] = sequence_dir
+#         size_mb = sum(path.stat().st_size for path in sequence_dir.glob("*.jpg")) / 1024 ** 2
+#         preparation_rows.append({"sequence": sequence, "frames": len(frame_names), "size_mb": size_mb})
+
+# display(pd.DataFrame(preparation_rows).round(2))
+
+===== CELL 30 (code) =====
+# %pip install -q loguru
+
+===== CELL 31 (code) =====
+# import gc
+
+# sam2_source = str(SAMURAI_DIR / "sam2")
+# if sam2_source not in sys.path:
+#     sys.path.insert(0, sam2_source)
+
+# from sam2.build_sam import build_sam2_video_predictor
+
+# gc.collect()
+# torch.cuda.empty_cache()
+# samurai_predictor = build_sam2_video_predictor(
+#     SAMURAI_CONFIG,
+#     str(SAMURAI_CHECKPOINT),
+#     device="cuda:0",
+#     apply_postprocessing=sam2_extension_available
+# )
+
+# allocated_gb = torch.cuda.memory_allocated() / 1024 ** 3
+# print(f"SAMURAI Base+ loaded on {torch.cuda.get_device_name(0)} | GPU memory: {allocated_gb:.2f} GB")
+
+===== CELL 32 (code) =====
+# import time
+
+# def run_samurai_sequence(sequence):
+#     ground_truth = train[train["sequence"] == sequence].sort_values("frame")[["x", "y", "width", "height"]].to_numpy(dtype=float)
+#     predictions = np.zeros_like(ground_truth)
+#     predictions[0] = ground_truth[0]
+#     empty_masks = 0
+
+#     torch.cuda.reset_peak_memory_stats()
+#     torch.cuda.synchronize()
+#     start_time = time.perf_counter()
+
+#     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+#         state = samurai_predictor.init_state(str(samurai_frame_dirs[sequence]), offload_video_to_cpu=True, offload_state_to_cpu=True)
+#         x, y, width, height = ground_truth[0]
+#         initial_box = np.array([x, y, x + width, y + height], dtype=np.float32)
+#         samurai_predictor.add_new_points_or_box(state, box=initial_box, frame_idx=0, obj_id=0)
+
+#         iterator = samurai_predictor.propagate_in_video(state)
+#         for frame_index, object_ids, mask_logits in tqdm(iterator, total=len(ground_truth), desc=sequence):
+#             if frame_index == 0:
+#                 continue
+
+#             mask = (mask_logits[0, 0] > 0).cpu().numpy()
+#             rows, columns = np.nonzero(mask)
+#             if len(columns):
+#                 x_min, x_max = columns.min(), columns.max()
+#                 y_min, y_max = rows.min(), rows.max()
+#                 predictions[frame_index] = [x_min, y_min, x_max - x_min + 1, y_max - y_min + 1]
+#             else:
+#                 predictions[frame_index] = predictions[frame_index - 1]
+#                 empty_masks += 1
+
+#     torch.cuda.synchronize()
+#     elapsed = time.perf_counter() - start_time
+#     peak_gpu_gb = torch.cuda.max_memory_allocated() / 1024 ** 3
+#     metrics = tracking_metrics(ground_truth, predictions)
+
+#     samurai_predictor.reset_state(state)
+#     del state
+#     gc.collect()
+#     torch.cuda.empty_cache()
+
+#     row = {
+#         "sequence": sequence,
+#         "sensor": sequence.split("-", 1)[0],
+#         "frames": len(ground_truth),
+#         "empty_masks": empty_masks,
+#         "seconds": elapsed,
+#         "fps": len(ground_truth) / elapsed,
+#         "peak_gpu_gb": peak_gpu_gb,
+#         **metrics
+#     }
+#     return predictions, row
+
+# samurai_predictions, samurai_rows = {}, []
+# for sequence in EXPERIMENT_SEQUENCES:
+#     samurai_predictions[sequence], row = run_samurai_sequence(sequence)
+#     samurai_rows.append(row)
+
+# samurai_results = pd.DataFrame(samurai_rows)
+# metric_columns = ["precision_20", "success_auc", "mean_iou", "center_error"]
+# mean_comparison = pd.DataFrame({
+#     "Fixed box": baseline_results[metric_columns].mean(),
+#     "SAMURAI": samurai_results[metric_columns].mean()
+# }).T
+
+# display(samurai_results.round(3))
+# display(mean_comparison.round(3))
+
+===== CELL 33 (markdown) =====
+- TODO: Explore hyperspectral-band fusion beyond false-color tracking.
+
+===== CELL 34 (markdown) =====
+# 4. Tracking pipeline
+
+- Prepare false-color frames and initial boxes.
+- Track sequences with SAMURAI on two GPUs.
+- Merge and validate predictions.
+
+===== CELL 35 (code) =====
+import os, sys, time, json, subprocess
+
+MODE = "final"  # smoke / final
+SMOKE_FRAMES = 12
+MAX_GPUS = 2
+
+if MODE not in {"smoke", "final"}:
+    raise ValueError("MODE must be either 'smoke' or 'final'")
+
+PIPELINE_DIR = CACHE_DIR / f"pipeline_{MODE}"
+FRAME_DIR = PIPELINE_DIR / "frames"
+INIT_DIR = PIPELINE_DIR / "initialization"
+RESULT_DIR = PIPELINE_DIR / "predictions"
+for directory in (PIPELINE_DIR, FRAME_DIR, INIT_DIR, RESULT_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+SAMURAI_DIR = CACHE_DIR / "samurai"
+SAMURAI_CHECKPOINT = SAMURAI_DIR / "sam2/checkpoints/sam2.1_hiera_base_plus.pt"
+SAMURAI_CONFIG = "configs/samurai/sam2.1_hiera_b+.yaml"
+CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt"
+
+if not (SAMURAI_DIR / "sam2").exists():
+    print("Downloading SAMURAI source...")
+    clone = subprocess.run(["git", "clone", "--depth", "1", "https://github.com/yangchris11/samurai.git", str(SAMURAI_DIR)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if clone.returncode != 0:
+        raise RuntimeError(clone.stdout[-2000:])
+
+print("Installing SAMURAI...")
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "loguru"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-build-isolation", "-e", str(SAMURAI_DIR / "sam2")], check=True)
+
+SAMURAI_CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+if not SAMURAI_CHECKPOINT.exists() or SAMURAI_CHECKPOINT.stat().st_size < 300 * 1024**2:
+    torch.hub.download_url_to_file(CHECKPOINT_URL, str(SAMURAI_CHECKPOINT), progress=True)
+
+commit = subprocess.check_output(["git", "-C", str(SAMURAI_DIR), "rev-parse", "--short", "HEAD"], text=True).strip()
+print(f"Mode: {MODE.upper()} | SAMURAI: {commit} | Checkpoint: {SAMURAI_CHECKPOINT.stat().st_size / 1024**2:.1f} MB")
+
+===== CELL 36 (code) =====
+pipeline_rows = test.copy()
+pipeline_rows["row_order"] = np.arange(len(pipeline_rows))
+pipeline_rows["sequence_frame"] = pipeline_rows.groupby("sequence", sort=False).cumcount()
+
+if MODE == "smoke":
+    smoke_sequences = pipeline_rows.drop_duplicates("sensor")["sequence"].tolist()
+    pipeline_rows = pipeline_rows[pipeline_rows["sequence"].isin(smoke_sequences)].groupby("sequence", sort=False).head(SMOKE_FRAMES).copy()
+
+active_sequences = pipeline_rows["sequence"].drop_duplicates().tolist()
+pipeline_rows["remote_path"] = [resolve_test_source(row.sequence, "color", row.frame) for row in pipeline_rows.itertuples()]
+pipeline_rows["local_path"] = [FRAME_DIR / row.sequence / f"{row.sequence_frame:06d}.jpg" for row in pipeline_rows.itertuples()]
+
+frame_jobs = pipeline_rows[["remote_path", "local_path"]].copy()
+frame_jobs["kind"] = "frame"
+init_jobs = pd.DataFrame({
+    "remote_path": [resolve_test_initialization(sequence) for sequence in active_sequences],
+    "local_path": [INIT_DIR / f"{sequence}.txt" for sequence in active_sequences],
+    "kind": "initialization"
+})
+download_jobs = pd.concat([frame_jobs, init_jobs], ignore_index=True)
+
+print(f"{MODE.upper()}: {len(active_sequences)} sequences, {len(pipeline_rows):,} frames, {len(download_jobs):,} files")
+display(pipeline_rows.groupby("sensor").agg(sequences=("sequence", "nunique"), frames=("ID", "size")))
+
+===== CELL 37 (code) =====
+pending_jobs = download_jobs.copy()
+download_errors = pd.DataFrame()
+
+for attempt in range(1, 4):
+    download_errors = download_many(pending_jobs, workers=24, description=f"Downloading {MODE} data")
+    if download_errors.empty:
+        break
+    pending_jobs = pending_jobs[pending_jobs["remote_path"].isin(download_errors["remote_path"])].copy()
+    if attempt < 3:
+        print(f"Retrying {len(pending_jobs)} files...")
+
+if not download_errors.empty:
+    display(download_errors.head(10))
+    raise RuntimeError(f"{len(download_errors)} files could not be downloaded")
+
+download_size = sum(Path(path).stat().st_size for path in download_jobs["local_path"]) / 1024**2
+print(f"Data ready: {len(download_jobs):,} files, {download_size:.1f} MB")
+
+===== CELL 38 (code) =====
+%%writefile /kaggle/temp/hotc2026/samurai_worker.py
+import argparse, gc, json, time, warnings
+from pathlib import Path
+import numpy as np, torch
+
+warnings.filterwarnings("ignore", message="Flash Attention is disabled.*")
+from sam2.build_sam import build_sam2_video_predictor
+import sam2.sam2_video_predictor as sam2_video_module
+import sam2.utils.misc as sam2_misc
+
+def no_progress(iterable, *args, **kwargs):
+    return iterable
+
+sam2_video_module.tqdm = no_progress
+sam2_misc.tqdm = no_progress
+
+def load_initial_box(path):
+    text = Path(path).read_text().replace(",", " ").replace("\t", " ")
+    values = np.fromstring(text, sep=" ", dtype=float)
+    if len(values) < 4:
+        raise ValueError(f"Could not read an x, y, width, height box from {path}")
+    return values[:4]
+
+def valid_result(path, expected_frames):
+    try:
+        return np.load(path).shape == (expected_frames, 4)
+    except Exception:
+        return False
+
+def mask_to_box(mask, previous_box):
+    mask = mask.detach().cpu().numpy() > 0
+    y, x = np.where(mask)
+    if len(x) == 0:
+        return previous_box.copy(), True
+    return np.array([x.min(), y.min(), x.max() - x.min() + 1, y.max() - y.min() + 1], dtype=float), False
+
+def track_sequence(predictor, task):
+    frame_dir, result_path = Path(task["frame_dir"]), Path(task["result_path"])
+    expected_frames = int(task["frames"])
+    if valid_result(result_path, expected_frames):
+        print(f'{task["sequence"]}: already complete', flush=True)
+        return
+
+    frame_count = len(list(frame_dir.glob("*.jpg")))
+    if frame_count != expected_frames:
+        raise RuntimeError(f'{task["sequence"]}: found {frame_count} frames, expected {expected_frames}')
+
+    initial_box = load_initial_box(task["init_path"])
+    x, y, width, height = initial_box
+    prompt_box = np.array([x, y, x + width, y + height], dtype=np.float32)
+    predictions = np.full((expected_frames, 4), np.nan, dtype=float)
+    previous_box, empty_masks = initial_box.copy(), 0
+    start = time.perf_counter()
+
+    state = predictor.init_state(str(frame_dir), offload_video_to_cpu=True, offload_state_to_cpu=True, async_loading_frames=True)
+    predictor.add_new_points_or_box(state, frame_idx=0, obj_id=0, box=prompt_box)
+    for frame_index, _, masks in predictor.propagate_in_video(state):
+        box, empty = mask_to_box(masks[0, 0], previous_box)
+        if frame_index < expected_frames:
+            predictions[frame_index] = box
+        previous_box = box
+        empty_masks += int(empty)
+
+    predictions[0] = initial_box
+    for frame_index in range(1, expected_frames):
+        if not np.isfinite(predictions[frame_index]).all():
+            predictions[frame_index] = predictions[frame_index - 1]
+
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = result_path.with_suffix(".npy.part")
+    with temporary_path.open("wb") as file:
+        np.save(file, predictions)
+    temporary_path.replace(result_path)
+
+    predictor.reset_state(state)
+    del state
+    gc.collect(); torch.cuda.empty_cache()
+    seconds = time.perf_counter() - start
+    print(f'{task["sequence"]}: {expected_frames} frames, {empty_masks} empty masks, {seconds:.1f}s', flush=True)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tasks", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--config", required=True)
+    args = parser.parse_args()
+
+    tasks = json.loads(Path(args.tasks).read_text())
+    pending = [task for task in tasks if not valid_result(task["result_path"], int(task["frames"]))]
+    if not pending:
+        return
+
+    torch.cuda.set_device(0)
+    predictor = build_sam2_video_predictor(args.config, args.checkpoint, device="cuda:0")
+    print(f"Model ready on {torch.cuda.get_device_name(0)}", flush=True)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+        for task in pending:
+            track_sequence(predictor, task)
+
+if __name__ == "__main__":
+    main()
+
+===== CELL 39 (code) =====
+WORKER_PATH = CACHE_DIR / "samurai_worker.py"
+sequence_counts = pipeline_rows.groupby("sequence", sort=False).size().sort_values(ascending=False)
+gpu_count = min(MAX_GPUS, N_GPUS, len(sequence_counts))
+
+if gpu_count == 0:
+    raise RuntimeError("A GPU is required for SAMURAI inference")
+
+tasks_by_gpu = [[] for _ in range(gpu_count)]
+gpu_loads = [0] * gpu_count
+
+for sequence, frame_count in sequence_counts.items():
+    gpu_index = int(np.argmin(gpu_loads))
+    tasks_by_gpu[gpu_index].append({
+        "sequence": sequence,
+        "frames": int(frame_count),
+        "frame_dir": str(FRAME_DIR / sequence),
+        "init_path": str(INIT_DIR / f"{sequence}.txt"),
+        "result_path": str(RESULT_DIR / f"{sequence}.npy")
+    })
+    gpu_loads[gpu_index] += int(frame_count)
+
+display(pd.DataFrame([{"gpu": index, "sequences": len(tasks), "frames": gpu_loads[index]} for index, tasks in enumerate(tasks_by_gpu)]))
+
+def result_is_valid(path, expected_frames):
+    try:
+        return np.load(path).shape == (expected_frames, 4)
+    except Exception:
+        return False
+
+for tasks in tasks_by_gpu:
+    for task in tasks:
+        result_path = Path(task["result_path"])
+        if result_path.exists() and not result_is_valid(result_path, task["frames"]):
+            result_path.unlink()
+
+process_records, log_handles = [], []
+for gpu_index, tasks in enumerate(tasks_by_gpu):
+    task_path = PIPELINE_DIR / f"gpu_{gpu_index}_tasks.json"
+    log_path = PIPELINE_DIR / f"gpu_{gpu_index}.log"
+    task_path.write_text(json.dumps(tasks))
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    environment["PYTHONUNBUFFERED"] = "1"
+    repository_path = str(SAMURAI_DIR / "sam2")
+    environment["PYTHONPATH"] = repository_path + (os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else "")
+
+    log_handle = log_path.open("w")
+    command = [sys.executable, str(WORKER_PATH), "--tasks", str(task_path), "--checkpoint", str(SAMURAI_CHECKPOINT), "--config", SAMURAI_CONFIG]
+    process = subprocess.Popen(command, cwd=SAMURAI_DIR, env=environment, stdout=log_handle, stderr=subprocess.STDOUT)
+    process_records.append((gpu_index, process, log_path))
+    log_handles.append(log_handle)
+
+frame_counts = sequence_counts.to_dict()
+result_paths = {sequence: RESULT_DIR / f"{sequence}.npy" for sequence in sequence_counts.index}
+completed = {sequence for sequence, path in result_paths.items() if result_is_valid(path, frame_counts[sequence])}
+
+try:
+    with tqdm(total=int(sequence_counts.sum()), initial=sum(frame_counts[sequence] for sequence in completed), desc=f"{MODE.upper()} tracking", unit="frame") as progress:
+        while True:
+            current = {sequence for sequence, path in result_paths.items() if result_is_valid(path, frame_counts[sequence])}
+            newly_completed = current - completed
+            progress.update(sum(frame_counts[sequence] for sequence in newly_completed))
+            progress.set_postfix(sequences=f"{len(current)}/{len(sequence_counts)}")
+            completed = current
+            if all(process.poll() is not None for _, process, _ in process_records):
+                break
+            time.sleep(2)
+except KeyboardInterrupt:
+    for _, process, _ in process_records:
+        process.terminate()
+    for _, process, _ in process_records:
+        process.wait()
+    raise
+finally:
+    for log_handle in log_handles:
+        log_handle.close()
+
+failures = []
+for gpu_index, process, log_path in process_records:
+    process.wait()
+    if process.returncode != 0:
+        log_tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-20:])
+        failures.append(f"GPU {gpu_index} failed:\n{log_tail}")
+
+if failures:
+    raise RuntimeError("\n\n".join(failures))
+
+missing_sequences = [sequence for sequence, path in result_paths.items() if not result_is_valid(path, frame_counts[sequence])]
+if missing_sequences:
+    raise RuntimeError(f"Missing results for {len(missing_sequences)} sequences: {missing_sequences[:5]}")
+
+print(f"Inference complete: {len(sequence_counts)} sequences and {sequence_counts.sum():,} frames")
+
+===== CELL 40 (code) =====
+def read_initial_box(path):
+    text = Path(path).read_text().replace(",", " ").replace("\t", " ")
+    values = np.fromstring(text, sep=" ", dtype=float)
+    return values[:4]
+
+prediction_parts = []
+first_box_matches, invalid_boxes, outside_boxes = 0, 0, 0
+
+for sequence in active_sequences:
+    sequence_rows = pipeline_rows[pipeline_rows["sequence"] == sequence].sort_values("sequence_frame").copy()
+    boxes = np.load(RESULT_DIR / f"{sequence}.npy")
+
+    if len(boxes) != len(sequence_rows) or not np.isfinite(boxes).all():
+        raise RuntimeError(f"Invalid prediction array for {sequence}")
+
+    boxes = np.rint(boxes).astype(int)
+    initial_box = np.rint(read_initial_box(INIT_DIR / f"{sequence}.txt")).astype(int)
+    first_box_matches += int(np.array_equal(boxes[0], initial_box))
+    invalid_boxes += int(((boxes[:, 2] <= 0) | (boxes[:, 3] <= 0)).sum())
+
+    image = cv2.imread(str(sequence_rows.iloc[0]["local_path"]))
+    image_height, image_width = image.shape[:2]
+    outside = (boxes[:, 0] < 0) | (boxes[:, 1] < 0) | (boxes[:, 0] + boxes[:, 2] > image_width) | (boxes[:, 1] + boxes[:, 3] > image_height)
+    outside_boxes += int(outside.sum())
+
+    sequence_rows[["x", "y", "width", "height"]] = boxes
+    prediction_parts.append(sequence_rows)
+
+detailed_predictions = pd.concat(prediction_parts).sort_values("row_order")
+pipeline_predictions = detailed_predictions[["ID", "x", "y", "width", "height"]].reset_index(drop=True)
+expected_ids = pipeline_rows.sort_values("row_order")["ID"].reset_index(drop=True)
+id_order_matches = pipeline_predictions["ID"].equals(expected_ids)
+
+validation_summary = pd.DataFrame([{
+    "mode": MODE,
+    "sequences": len(active_sequences),
+    "frames": len(pipeline_predictions),
+    "ID_order_matches": id_order_matches,
+    "first_boxes_match": f"{first_box_matches}/{len(active_sequences)}",
+    "invalid_boxes": invalid_boxes,
+    "outside_boxes": outside_boxes
+}])
+display(validation_summary)
+display(pd.concat([pipeline_predictions.head(3), pipeline_predictions.tail(3)]))
+
+if not id_order_matches or first_box_matches != len(active_sequences) or invalid_boxes or outside_boxes:
+    raise RuntimeError("Prediction validation failed")
+
+PREDICTIONS_PATH = WORK_DIR / f"{MODE}_predictions.csv"
+pipeline_predictions.to_csv(PREDICTIONS_PATH, index=False)
+print(f"Saved {PREDICTIONS_PATH} | {PREDICTIONS_PATH.stat().st_size / 1024**2:.2f} MB")
+
+if MODE == "smoke":
+    print("Smoke test passed.")
+elif len(pipeline_predictions) != len(submission_template):
+    raise RuntimeError("FINAL mode did not produce every required prediction")
+
+===== CELL 41 (markdown) =====
+# 5. Submission
+
+===== CELL 42 (code) =====
+SUBMISSION_PATH = WORK_DIR / "submission.csv"
+
+if MODE == "smoke":
+    print("Submission skipped in smoke mode.")
+else:
+    prediction_path = WORK_DIR / "final_predictions.csv"
+    if not prediction_path.exists():
+        raise RuntimeError("final_predictions.csv was not created by Section 4")
+
+    final_predictions = pd.read_csv(prediction_path)
+    box_columns = ["x", "y", "width", "height"]
+    missing_ids = set(submission_template["ID"]) - set(final_predictions["ID"])
+    extra_ids = set(final_predictions["ID"]) - set(submission_template["ID"])
+    problems = []
+
+    if final_predictions["ID"].duplicated().any():
+        problems.append("duplicated prediction IDs")
+    if missing_ids:
+        problems.append(f"{len(missing_ids)} missing IDs")
+    if extra_ids:
+        problems.append(f"{len(extra_ids)} unexpected IDs")
+    if problems:
+        raise RuntimeError("Submission validation failed: " + ", ".join(problems))
+
+    submission = submission_template[["ID"]].merge(final_predictions, on="ID", how="left", sort=False)
+    submission = submission[submission_template.columns]
+
+    if submission[box_columns].isna().any().any():
+        raise RuntimeError("The submission contains missing bounding boxes")
+
+    submission[box_columns] = np.rint(submission[box_columns]).astype(int)
+    if (submission[["x", "y"]] < 0).any().any() or (submission[["width", "height"]] <= 0).any().any():
+        raise RuntimeError("The submission contains invalid bounding boxes")
+    if not submission["ID"].equals(submission_template["ID"]):
+        raise RuntimeError("Submission IDs are not in the required order")
+
+    submission.to_csv(SUBMISSION_PATH, index=False)
+    saved_submission = pd.read_csv(SUBMISSION_PATH)
+    if len(saved_submission) != len(submission_template) or list(saved_submission.columns) != list(submission_template.columns):
+        raise RuntimeError("The saved submission has an incorrect shape or columns")
+
+    display(pd.DataFrame([{
+        "rows": len(submission),
+        "sequences": test["sequence"].nunique(),
+        "missing_values": int(submission.isna().sum().sum()),
+        "file_mb": SUBMISSION_PATH.stat().st_size / 1024**2
+    }]).round(3))
+    display(pd.concat([submission.head(3), submission.tail(3)]))
+    print(f"Submission ready: {SUBMISSION_PATH}")

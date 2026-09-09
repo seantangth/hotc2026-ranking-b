@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "default_profile": "rankB_deliver_v090",
+  "profiles": {
+    "rankB_robust": {
+      "description": "Ranking B 泛化優先：因果全圖雙底座、SAMURAI 每序列重置、不使用資料集特化品質頭。coordinate_correction 於 08-28 由 top-only 改為 both——正式 405 grouped OOF 在**兩個配對上都顯示 both 較優**（crop +0.00251、full-frame +0.00149）。原本的 top-only 依據是 08-24 的 fresh q95 val smoke，該檔自標為 non-formal。",
+      "tracking": {
+        "primary_backend": "sam3",
+        "source_backend": "samurai",
+        "samurai_reset_between_sequences": true,
+        "sam3_eval": true
+      },
+      "offline_two_pass_crop": {
+        "profile_intent": "disabled",
+        "area_fraction_max": 0.55,
+        "window_sources": [
+          "primary",
+          "source"
+        ]
+      },
+      "postprocess": {
+        "coordinate_correction": "both",
+        "frozen_splice_k": 6,
+        "quality_head": "none",
+        "first_frame_policy": "preserve_init",
+        "selector": "none",
+        "third_leg_rescue": false
+      },
+      "validation": {
+        "sample_submission_required": true,
+        "reject_tracker_fallback": true,
+        "exact_id_set": true,
+        "finite_positive_boxes": true
+      }
+    },
+    "rankB_robust_crop": {
+      "description": "Ranking B 主檔候選：rankB_robust 的全部 robust 設定（SAMURAI 每序列重置、qhead none、首幀 exact init）＋ 啟用 offline two-pass crop。crop 在 test75 上實測值 +0.0271（v032 0.67998 → v029 0.70712）；v068 已證無 crop 版只有 0.68049。coordinate_correction 事前登記為 both——唯一有 LB 讀數的 crop 組態鏈（v029 0.70712 → v049 0.71316）全部用 both；top-only 的優勢只量在 full-frame pair 上，依 D044 不可跨 pair 沿用。改用 top-only 需 crop-pair grouped OOF 的 pooled Δ 支持，不得依 LB 事後挑選。two-pass 仍須顯式 --allow-offline-two-pass。",
+      "tracking": {
+        "primary_backend": "sam3",
+        "source_backend": "samurai",
+        "samurai_reset_between_sequences": true,
+        "sam3_eval": true
+      },
+      "offline_two_pass_crop": {
+        "profile_intent": "enabled",
+        "area_fraction_max": 0.55,
+        "window_sources": [
+          "primary",
+          "source"
+        ]
+      },
+      "postprocess": {
+        "coordinate_correction": "both",
+        "frozen_splice_k": 6,
+        "quality_head": "none",
+        "first_frame_policy": "preserve_init",
+        "selector": "none",
+        "third_leg_rescue": false
+      },
+      "validation": {
+        "sample_submission_required": true,
+        "reject_tracker_fallback": true,
+        "exact_id_set": true,
+        "finite_positive_boxes": true
+      }
+    },
+    "rankA_best": {
+      "description": "Ranking A 已驗證 LB 配方：雙底座 two-pass crop、both 校正與 v056；首幀仍強制還原 init。",
+      "tracking": {
+        "primary_backend": "sam3",
+        "source_backend": "samurai",
+        "samurai_reset_between_sequences": false,
+        "sam3_eval": false
+      },
+      "offline_two_pass_crop": {
+        "profile_intent": "enabled",
+        "area_fraction_max": 0.55,
+        "window_sources": [
+          "primary",
+          "source"
+        ]
+      },
+      "postprocess": {
+        "coordinate_correction": "both",
+        "frozen_splice_k": 6,
+        "quality_head": "v056",
+        "first_frame_policy": "preserve_init",
+        "selector": "none",
+        "third_leg_rescue": false
+      },
+      "validation": {
+        "sample_submission_required": true,
+        "reject_tracker_fallback": true,
+        "exact_id_set": true,
+        "finite_positive_boxes": true
+      }
+    },
+    "rankB_deliver_v078": {
+      "description": "9/7 交付主檔（08-29 定案）：rankB_robust_crop 的全部設定 ＋ 三個 08-28/29 LB 實測增益層——selector-v2（D085，gain-weighted ΔIoU 迴歸，τ=0.05 固化權重）、v056 RedNIR 品質頭疊加（D091：405 OOF 說 −0.00233、LB 實測 +0.00087，符號相反，依 D084 以 LB 為準）、第三腿死區救援（D091：main 凍結≥6 且 SAMURAI 亦死的幀借 full-frame SAM3 腿，+0.00029）。整條鏈於 test75 位元級等於 sub_v078＝LB 0.71666，由 finalize_submission.py --selftest 的 (c) 段守護。⚠️ selector 權重是在 405 train 上 fit 的固化係數（不看 test/ranking 資料）；9/7 只載入不重訓。⚠️ two-pass crop 仍須顯式 --allow-offline-two-pass。",
+      "tracking": {
+        "primary_backend": "sam3",
+        "source_backend": "samurai",
+        "samurai_reset_between_sequences": true,
+        "sam3_eval": true
+      },
+      "offline_two_pass_crop": {
+        "profile_intent": "enabled",
+        "area_fraction_max": 0.55,
+        "window_sources": [
+          "primary",
+          "source"
+        ]
+      },
+      "postprocess": {
+        "coordinate_correction": "both",
+        "frozen_splice_k": 6,
+        "quality_head": "v056",
+        "first_frame_policy": "preserve_init",
+        "selector": "v2",
+        "third_leg_rescue": true
+      },
+      "validation": {
+        "sample_submission_required": true,
+        "reject_tracker_fallback": true,
+        "exact_id_set": true,
+        "finite_positive_boxes": true
+      }
+    },
+    "rankB_deliver_v090": {
+      "description": "9/7 交付主檔候選（08-31 D101）：rankB_deliver_v078 的全部設定 ＋ **crop 窗三方共識**。背景（D100）：交付管線 vs 榜上 best 的 0.0097 落差 100% 來自 SAM3 腿的 crop 階段，88% 集中在 5 支，而其中 4 支的 full-frame 追蹤完全正常（IoU 0.98/0.99/0.99/0.93）⇒ 不是模型變差，是 crop 窗的微小差異讓遞迴追蹤發散。兩個「找原因」的修法假說已被自己的數據否證（crop-vs-full 不一致偵測無可用切點；穩健包絡對崩壞與正常序列無差別）⇒ 改為**降低窗的運氣成分**：三組同樣合理但不同保守度的窗各跑一次 crop-SAM3，逐幀取 medoid。LB 實測 v090 ＝ 0.71096，vs 單一窗的同鏈 0.70701 ＝ **+0.00395**（救回落差的 41%）。⚠️ 三組窗都**只用本次 run 自己的 full 輸出**算，不依賴任何歷史檔案 ⇒ 9/7 可複製；且**沒有在 test75 上挑窗**——挑窗正是 D100 診斷出的病。⚠️ 只有 SAM3 主腿走共識：問題在它；SAMURAI 腿（每序列重置）v087 實測比舊版好 +0.00064，沿用窗 A。第三腿死區救援仍取 full-frame SAM3。代價＝多跑兩組 crop ≈ +80 分鐘（9/7 單次約 4.5 小時）。位元級守護＝finalize_submission.py --selftest 的 (d) 段。",
+      "tracking": {
+        "primary_backend": "sam3",
+        "source_backend": "samurai",
+        "samurai_reset_between_sequences": true,
+        "sam3_eval": true
+      },
+      "offline_two_pass_crop": {
+        "profile_intent": "enabled",
+        "area_fraction_max": 0.55,
+        "window_sources": [
+          "primary",
+          "source"
+        ],
+        "window_consensus": {
+          "enabled": true,
+          "medoid_tie_breaker": "first_variant",
+          "source_leg_variant": "A",
+          "variants": [
+            {
+              "tag": "A",
+              "envelope_extra": true,
+              "segments": 1,
+              "note": "現行窗＝base 自己的 full-SAM3、extra 自己的 full-SAMURAI、area 0.55。**必須排第一**：medoid 平手取第一個輸入＝現任，順序改變會改變輸出。"
+            },
+            {
+              "tag": "B",
+              "envelope_extra": true,
+              "segments": 2,
+              "note": "切兩段各算窗 ⇒ 軌跡範圍較小、窗更緊、放大更大。⚠️ 08-31 實測產生 72 段（非 31 支）＝實質是不同策略而非同原則擾動，屬已知設計瑕疵，但 LB 已驗證整組合為 +0.00395，故照原樣固化。"
+            },
+            {
+              "tag": "C",
+              "envelope_extra": false,
+              "segments": 1,
+              "note": "窗只由主腿自己的軌跡決定（不併入 SAMURAI 包絡）。"
+            }
+          ]
+        }
+      },
+      "postprocess": {
+        "coordinate_correction": "both",
+        "frozen_splice_k": 6,
+        "quality_head": "v056",
+        "first_frame_policy": "preserve_init",
+        "selector": "v2",
+        "third_leg_rescue": true
+      },
+      "validation": {
+        "sample_submission_required": true,
+        "reject_tracker_fallback": true,
+        "exact_id_set": true,
+        "finite_positive_boxes": true
+      }
+    }
+  }
+}

@@ -1,0 +1,149 @@
+diff --git a/sam2/sam2/modeling/sam2_base.py b/sam2/sam2/modeling/sam2_base.py
+index 1291091..23ef55f 100755
+--- a/sam2/sam2/modeling/sam2_base.py
++++ b/sam2/sam2/modeling/sam2_base.py
+@@ -724,7 +724,7 @@ class SAM2Base(torch.nn.Module):
+                     self.kf_mean, self.kf_covariance = self.kf.update(self.kf_mean, self.kf_covariance, self.kf.xyxy_to_xyah(high_res_multibboxes[best_iou_inds]))
+             # memory selection
+             if self.rvcot_mem_selection and self.rvcot_mem_selection_method == 'default':
+-                cur_area = (high_res_masks>0).sum().cpu().numpy()
++                cur_area = (high_res_masks>0).sum().cpu().float().numpy()
+                 self.rvcor_area_list.append(cur_area)
+                 if len(self.rvcor_area_list) > 1 and cur_area >= 1:
+                     obj_sizes_ratio = cur_area / np.median([
+@@ -738,10 +738,10 @@ class SAM2Base(torch.nn.Module):
+                 iouflag = siou > 0.8
+                 if iouflag and obj_sizes_ratio >= 0.8 and obj_sizes_ratio <= 1.2 and cur_area >= 1 :
+                     # other mask proposals
+-                    alternative_masks =  [high_res_multimasks[0, i].cpu().numpy() for i in range(3) if i!=best_iou_inds]
++                    alternative_masks =  [high_res_multimasks[0, i].cpu().float().numpy() for i in range(3) if i!=best_iou_inds]
+                                      
+                     # Numpy array of the chosen mask and corresponding bounding box
+-                    chosen_mask_np = (high_res_multimasks[0, best_iou_inds[0]]>0).cpu().numpy().astype(np.uint8).copy()
++                    chosen_mask_np = (high_res_multimasks[0, best_iou_inds[0]]>0).cpu().float().numpy().astype(np.uint8).copy()
+                     chosen_bbox = Mask(chosen_mask_np>0).convert(RegionType.RECTANGLE)
+ 
+                     # Delete the parts of the alternative masks that overlap with the chosen mask
+@@ -769,7 +769,7 @@ class SAM2Base(torch.nn.Module):
+                                 self.rvcot_mem_selection_highconf_frameidx.append(frame_idx)# Update the last added frame index
+             elif self.rvcot_mem_selection and self.rvcot_mem_selection_method == 'hsdf_dist':
+                 ### area constraint
+-                cur_area = (high_res_masks>0).sum().cpu().numpy()
++                cur_area = (high_res_masks>0).sum().cpu().float().numpy()
+                 cur_d = 2*np.sqrt(cur_area /np.pi) 
+                 self.rvcor_area_list.append(cur_area)
+                 if len(self.rvcor_area_list) > 1 and cur_area >= 1:
+@@ -790,8 +790,8 @@ class SAM2Base(torch.nn.Module):
+                 siou_ratio_flag = (iou_ratio > self.rvcot_siou_ratio_threshold)
+                 if siou_ratio_flag and obj_sizes_ratio >= 0.75 and obj_sizes_ratio <= 1.25 and iouflag and  cur_area >= 1 :
+                     # hsdf dist constraint
+-                    chosen_mask_np = (high_res_multimasks[0, best_iou_inds[0]]>0).cpu().numpy().astype(np.uint8).copy()
+-                    alternative_masks =  [(high_res_multimasks[0, i]>0).cpu().numpy().astype(np.uint8) for i in range(3) if i!=best_iou_inds]
++                    chosen_mask_np = (high_res_multimasks[0, best_iou_inds[0]]>0).cpu().float().numpy().astype(np.uint8).copy()
++                    alternative_masks =  [(high_res_multimasks[0, i]>0).cpu().float().numpy().astype(np.uint8) for i in range(3) if i!=best_iou_inds]
+                     alternative_masks = [np.logical_and(m_, np.logical_not(chosen_mask_np)).astype(np.uint8)  for m_ in alternative_masks]
+                     #discard noise using largest component
+                     alternative_masks = [keep_largest_component(m_) for m_ in alternative_masks if np.sum(m_) >= 1]
+@@ -1098,12 +1098,12 @@ class SAM2Base(torch.nn.Module):
+                 for frame_idx in long_list:  # Iterate over the number of mask memories
+                     out = output_dict["non_cond_frame_outputs"].get(frame_idx, None)  # Get output for the valid index
+                     if out is None:  # If not found, check unselected outputs
+-                        out = unselected_cond_outputs.get(valid_indices[idx], None)
++                        out = unselected_cond_outputs.get(frame_idx, None)
+                     t_pos_and_prevs.append((0, out))
+                 for t_pos, frame_idx in enumerate(short_list):
+                     out = output_dict["non_cond_frame_outputs"].get(frame_idx, None)  # Get output for the valid index
+                     if out is None:  # If not found, check unselected outputs
+-                        out = unselected_cond_outputs.get(valid_indices[idx], None)
++                        out = unselected_cond_outputs.get(frame_idx, None)
+                     # if not self.rcvot_idxreverse:
+                     # t_pos_and_prevs.append((t_pos+1, out))
+                     # else:
+diff --git a/sam2/sam2/modeling/sam2_utils.py b/sam2/sam2/modeling/sam2_utils.py
+index e16caae..00454c6 100755
+--- a/sam2/sam2/modeling/sam2_utils.py
++++ b/sam2/sam2/modeling/sam2_utils.py
+@@ -281,8 +281,8 @@ def sample_one_point_from_error_center(gt_masks, pred_masks, padding=True):
+     # positive label to correct the FN error
+     fn_masks = gt_masks & ~pred_masks
+ 
+-    fp_masks = fp_masks.cpu().numpy()
+-    fn_masks = fn_masks.cpu().numpy()
++    fp_masks = fp_masks.cpu().float().numpy()
++    fn_masks = fn_masks.cpu().float().numpy()
+     points = torch.zeros(B, 1, 2, dtype=torch.float)
+     labels = torch.ones(B, 1, dtype=torch.int32)
+     for b in range(B):
+diff --git a/sam2/sam2/sam2_image_predictor.py b/sam2/sam2/sam2_image_predictor.py
+index 41ce53a..c23c227 100755
+--- a/sam2/sam2/sam2_image_predictor.py
++++ b/sam2/sam2/sam2_image_predictor.py
+@@ -223,11 +223,11 @@ class SAM2ImagePredictor:
+                 return_logits=return_logits,
+                 img_idx=img_idx,
+             )
+-            masks_np = masks.squeeze(0).float().detach().cpu().numpy()
++            masks_np = masks.squeeze(0).float().detach().cpu().float().numpy()
+             iou_predictions_np = (
+-                iou_predictions.squeeze(0).float().detach().cpu().numpy()
++                iou_predictions.squeeze(0).float().detach().cpu().float().numpy()
+             )
+-            low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
++            low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().float().numpy()
+             all_masks.append(masks_np)
+             all_ious.append(iou_predictions_np)
+             all_low_res_masks.append(low_res_masks_np)
+@@ -297,9 +297,9 @@ class SAM2ImagePredictor:
+             return_logits=return_logits,
+         )
+ 
+-        masks_np = masks.squeeze(0).float().detach().cpu().numpy()
+-        iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
+-        low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
++        masks_np = masks.squeeze(0).float().detach().cpu().float().numpy()
++        iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().float().numpy()
++        low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().float().numpy()
+         return masks_np, iou_predictions_np, low_res_masks_np
+ 
+     def _prep_prompts(
+diff --git a/sam2/sam2/sam2_video_predictor.py b/sam2/sam2/sam2_video_predictor.py
+index 762cd48..e5dcb13 100755
+--- a/sam2/sam2/sam2_video_predictor.py
++++ b/sam2/sam2/sam2_video_predictor.py
+@@ -749,10 +749,10 @@ class SAM2VideoPredictor(SAM2Base):
+                 output_dict["frame_score_for_mem"][frame_idx] = {}
+                 #copy score to seperate dict for speedup
+                 frame_output = output_dict["frame_score_for_mem"][frame_idx]
+-                frame_output["best_iou_score"]  = current_out["best_iou_score"].cpu().numpy()
+-                frame_output["object_score_logits"]  = current_out["object_score_logits"].cpu().numpy()
+-                frame_output["kf_score"] = current_out["kf_score"].cpu().numpy()  if "kf_score" in current_out else None  
+-                frame_output["rvcot_ious"] = current_out["rvcot_ious"].cpu().numpy() if "rvcot_ious" in current_out else None  
++                frame_output["best_iou_score"]  = current_out["best_iou_score"].cpu().float().numpy()
++                frame_output["object_score_logits"]  = current_out["object_score_logits"].cpu().float().numpy()
++                frame_output["kf_score"] = current_out["kf_score"].cpu().float().numpy()  if "kf_score" in current_out else None  
++                frame_output["rvcot_ious"] = current_out["rvcot_ious"].cpu().float().numpy() if "rvcot_ious" in current_out else None  
+             # Create slices of per-object outputs for subsequent interaction with each
+             # individual object after tracking.
+             self._add_output_per_object(
+diff --git a/sam2/sam2/utils/amg.py b/sam2/sam2/utils/amg.py
+index 9868429..0c1e167 100755
+--- a/sam2/sam2/utils/amg.py
++++ b/sam2/sam2/utils/amg.py
+@@ -50,7 +50,7 @@ class MaskData:
+             elif isinstance(v, torch.Tensor):
+                 self._stats[k] = v[torch.as_tensor(keep, device=v.device)]
+             elif isinstance(v, np.ndarray):
+-                self._stats[k] = v[keep.detach().cpu().numpy()]
++                self._stats[k] = v[keep.detach().cpu().float().numpy()]
+             elif isinstance(v, list) and keep.dtype == torch.bool:
+                 self._stats[k] = [a for i, a in enumerate(v) if keep[i]]
+             elif isinstance(v, list):
+@@ -74,7 +74,7 @@ class MaskData:
+     def to_numpy(self) -> None:
+         for k, v in self._stats.items():
+             if isinstance(v, torch.Tensor):
+-                self._stats[k] = v.float().detach().cpu().numpy()
++                self._stats[k] = v.float().detach().cpu().float().numpy()
+ 
+ 
+ def is_box_near_crop_edge(

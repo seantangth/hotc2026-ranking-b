@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "default_profile": "rankB_deliver_v090_lean",
+  "profiles": {
+    "rankB_deliver_v090_lean": {
+      "description": "9/7 現場退路（09-05 稽核 G14）：rankB_deliver_v090 逐字複製，**只改 selector→none、quality_head→none**；corr both／splice K=6／第三腿救援／三窗共識全部保留。用途：若 9/7 的 selector 換框率落在事前登記的正常帶外（G12：目標尺度縮小時 14 維特徵會符號翻轉，s≈0.5 時換框率量到 51.9%），現場沒有預先核准的處置可執行——這個 profile 就是那個處置。**刻意放在獨立設定檔**，不動已封板的 ranking_profiles.json 一個位元；用 --config 指過來。",
+      "tracking": {
+        "primary_backend": "sam3",
+        "source_backend": "samurai",
+        "samurai_reset_between_sequences": true,
+        "sam3_eval": true
+      },
+      "offline_two_pass_crop": {
+        "profile_intent": "enabled",
+        "area_fraction_max": 0.55,
+        "window_sources": [
+          "primary",
+          "source"
+        ],
+        "window_consensus": {
+          "enabled": true,
+          "medoid_tie_breaker": "first_variant",
+          "source_leg_variant": "A",
+          "variants": [
+            {
+              "tag": "A",
+              "envelope_extra": true,
+              "segments": 1,
+              "note": "現行窗＝base 自己的 full-SAM3、extra 自己的 full-SAMURAI、area 0.55。**必須排第一**：medoid 平手取第一個輸入＝現任，順序改變會改變輸出。"
+            },
+            {
+              "tag": "B",
+              "envelope_extra": true,
+              "segments": 2,
+              "note": "切兩段各算窗 ⇒ 軌跡範圍較小、窗更緊、放大更大。⚠️ 08-31 實測產生 72 段（非 31 支）＝實質是不同策略而非同原則擾動，屬已知設計瑕疵，但 LB 已驗證整組合為 +0.00395，故照原樣固化。"
+            },
+            {
+              "tag": "C",
+              "envelope_extra": false,
+              "segments": 1,
+              "note": "窗只由主腿自己的軌跡決定（不併入 SAMURAI 包絡）。"
+            }
+          ]
+        }
+      },
+      "postprocess": {
+        "coordinate_correction": "both",
+        "frozen_splice_k": 6,
+        "quality_head": "none",
+        "first_frame_policy": "preserve_init",
+        "selector": "none",
+        "third_leg_rescue": true
+      },
+      "validation": {
+        "sample_submission_required": true,
+        "reject_tracker_fallback": true,
+        "exact_id_set": true,
+        "finite_positive_boxes": true
+      }
+    }
+  }
+}

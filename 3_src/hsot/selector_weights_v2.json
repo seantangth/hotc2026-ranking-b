@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "head": "selector-v2 (gain-weighted ridge on dIoU, D085)",
+  "tau_delivered": 0.05,
+  "tau_chosen_on_train": 0.05,
+  "train_pooled_gain": 0.0013648098667816064,
+  "n_fit_rows": 129511,
+  "effective_n": 42095.66621487838,
+  "n_features": 25,
+  "pair_profile": "rankB_robust_crop",
+  "corr": "both",
+  "K": 6,
+  "inputs": {
+    "train_main": {
+      "path": "/Users/seantang/Desktop/Sean/The_Nexus/1_Projects/WHISPERS_2026_HyperSOT/5_outputs/oof405_exact_pair_20260827/run/offline_two_pass/main_merged.csv",
+      "sha256": "474dff68ded4cb34a3410800a1121a205153309e79266fc009c62e37645680d3"
+    },
+    "train_source": {
+      "path": "/Users/seantang/Desktop/Sean/The_Nexus/1_Projects/WHISPERS_2026_HyperSOT/5_outputs/oof405_exact_pair_20260827/run/offline_two_pass/source_merged.csv",
+      "sha256": "5b4549dd82cdc11b5e546f779b97fc18f1cdd447e0268bd4217773c8e0587e94"
+    },
+    "contracts": "/Users/seantang/Desktop/Sean/The_Nexus/1_Projects/WHISPERS_2026_HyperSOT/5_outputs/oof405_exact_pair_20260827/contracts"
+  },
+  "weights_sha256": "9de88957f974cc9ff68f34cc49b9c8af6a25c02324048c5d2a555cb34d9ce252"
+}

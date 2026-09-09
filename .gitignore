@@ -1,0 +1,6 @@
+# run artefacts
+hotc2026_run/
+*.part
+__pycache__/
+*.pyc
+.DS_Store
