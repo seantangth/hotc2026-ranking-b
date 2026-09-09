@@ -19,12 +19,12 @@ bash setup_and_run.sh --ranking-dir /path/to/ranking             # 4-5 h for 75 
 `--ranking-dir` is the official folder holding `HSI-NIR-Falsecolor/`,
 `HSI-RedNIR-Falsecolor/` and `HSI-VIS-FalseColor/`. The script builds both virtual
 environments, fetches and hash-verifies the two public checkpoints, converts the official
-folder layout, runs the pre-flight checks and then produces:
+folder layout, runs the pre-flight checks and then writes **`submission.csv`** — one row per
+frame, in the format of the official `sample_submission.csv`. That single file is our submission.
 
-| Output | Profile | What it is |
-|---|---|---|
-| `submission_main.csv` | `rankB_deliver_v090` | **Primary submission.** |
-| `submission_onepass.csv` | `rankB_robust` | Strictly causal alternate, see §5. |
+A strictly causal one-pass alternate can also be produced, with `--with-onepass`; §5 explains
+when you might want it. It is off by default because `submission.csv` is the file we are
+submitting.
 
 Run `--dry-run` first: it does the whole setup and every fail-closed check, then stops before
 inference, so any problem surfaces immediately rather than hours in. It took **2 min 35 s** on a
@@ -44,8 +44,7 @@ rather drive the stages yourself.
 
 | File | What it is |
 |---|---|
-| `submission_main.csv` | **Primary submission.** Produced by profile `rankB_deliver_v090`. |
-| `submission_onepass.csv` | Strictly causal one-pass alternate. Produced by profile `rankB_robust`. See §5. |
+| `setup_and_run.sh` | One command: environment, checkpoints, ingestion, checks, inference. |
 | `3_src/` | All source code. Single entry point is `3_src/run_ranking_b.py`. |
 | `3_src/configs/ranking_profiles.json` | Every setting of every profile. Nothing is hard-coded outside this file. |
 | `3_src/requirements-rankingb.txt` | Dependency notes, weight URLs and SHA-256 hashes. |
@@ -60,7 +59,7 @@ rather drive the stages yourself.
 Both files come from the **same entry point**; they differ only by `--profile`
 (and by one explicit flag, see the note).
 
-### `submission_main.csv` — primary
+### `submission.csv` — our submission
 
 ```bash
 python 3_src/run_ranking_b.py \
@@ -73,7 +72,7 @@ python 3_src/run_ranking_b.py \
     --sam3-ckpt      <PATH>/sam3.pt \
     --samurai-dir    <PATH>/samurai \
     --samurai-ckpt   <PATH>/sam2.1_hiera_large.pt \
-    --out            submission_main.csv \
+    --out            submission.csv \
     --execute
 ```
 
@@ -82,7 +81,7 @@ python 3_src/run_ranking_b.py \
 > how the pipeline forces the two-pass structure (§5) to be an explicit, auditable choice
 > rather than a silent default.
 
-### `submission_onepass.csv` — strictly causal alternate
+### `submission_onepass.csv` — strictly causal alternate (only if you want it, see §5)
 
 ```bash
 python 3_src/run_ranking_b.py \
@@ -257,13 +256,15 @@ causal within a sequence, so it is not a literal one-pass run in the strictest r
 We could not find a ruling on this in the rules or the forum, and our question to the organizers
 went unanswered, so we are supplying **both** interpretations and leaving the choice to you:
 
-- `submission_main.csv` — two-pass, as described.
-- `submission_onepass.csv` — `rankB_robust`, strictly causal, single pass, no crop.
+- `submission.csv` — two-pass, as described. This is our submission.
+- `submission_onepass.csv` — `rankB_robust`, strictly causal, single pass, no crop. Produced
+  only if you pass `--with-onepass`, or run the profile directly as shown in §1.
 
-If the two-pass structure is not acceptable, please score `submission_onepass.csv`.
+If you judge the two-pass structure to fall outside OPE, please produce and score
+`submission_onepass.csv` instead; we would rather you had that option than not.
 
 For reference, both files were produced end-to-end by exactly these commands on the public
-Ranking A validation set and scored there as follows: `submission_main.csv` (profile
+Ranking A validation set and scored there as follows: the two-pass file (profile
 `rankB_deliver_v090`) **0.71096**; `submission_onepass.csv` (profile `rankB_robust`) **0.68148**
 (fresh A10 run, 2026-09-06). The two-pass crop and its consensus account for the difference.
 
@@ -279,7 +280,7 @@ computed from each run's own first pass — they are not selected per sequence o
 Protocol 3 requires the same model hyper-parameters for all sequences, so we should be precise
 about the one place where our post-processing is not literally identical across sequences.
 
-`submission_main.csv` reads the **modality prefix** of the sequence folder name — `nir-`,
+`submission.csv` reads the **modality prefix** of the sequence folder name — `nir-`,
 `rednir-` or `vis-` — in exactly two places, both in `3_src/finalize_submission.py` via
 `hsot/quality_head_v1.py::modality`:
 

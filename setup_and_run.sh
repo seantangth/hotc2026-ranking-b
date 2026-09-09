@@ -5,10 +5,13 @@
 #
 # It builds both virtual environments from the pinned lock files, fetches and
 # hash-verifies the two public checkpoints, converts the official folder layout
-# into the layout the tracker reads, and produces the two submission files:
+# into the layout the tracker reads, and produces the submission file:
 #
-#   <work-dir>/submission_main.csv      profile rankB_deliver_v090   (primary)
-#   <work-dir>/submission_onepass.csv   profile rankB_robust         (causal alternate)
+#   <work-dir>/submission.csv           profile rankB_deliver_v090
+#
+# That single file is our submission. A strictly causal one-pass alternate is available
+# with --with-onepass, for the reason explained in README section 5; it is not produced
+# by default because the file above is the one we are submitting.
 #
 # Every step is fail-closed: a bad checkpoint hash, a mismatched sequence count
 # or a failed pre-flight check stops the script rather than producing a wrong file.
@@ -29,7 +32,7 @@ WORK_DIR="$PWD/hotc2026_run"
 SAM3_CKPT=""
 SAMURAI_CKPT=""
 DRY_RUN=0
-SKIP_ONEPASS=0
+WITH_ONEPASS=0
 
 SAMURAI_SHA=76ba195984892b0d1e3db5d9c9f90bb62175680a
 SAM3_SHA=96914d2425f90a64f45ca977c2b5165418099543
@@ -53,7 +56,8 @@ Options
   --samurai-ckpt PATH  Use an existing sam2.1_hiera_large.pt.
   --dry-run            Set everything up and run the pre-flight checks, then stop
                        before inference. Use this first; it takes a few minutes.
-  --skip-onepass       Produce only submission_main.csv.
+  --with-onepass       Additionally produce submission_onepass.csv, the strictly causal
+                       one-pass alternate described in README section 5.
   -h, --help           This message.
 USAGE
 }
@@ -68,7 +72,7 @@ while [ $# -gt 0 ]; do
     --sam3-ckpt)     SAM3_CKPT="${2:?}"; shift 2 ;;
     --samurai-ckpt)  SAMURAI_CKPT="${2:?}"; shift 2 ;;
     --dry-run)       DRY_RUN=1; shift ;;
-    --skip-onepass)  SKIP_ONEPASS=1; shift ;;
+    --with-onepass)  WITH_ONEPASS=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -220,7 +224,7 @@ COMMON=( --frames-root "$FRAMES" --sample "$SAMPLE"
 
 say "7/8  Pre-flight checks (no inference yet)"
 "$PY1" "$SRC/run_ranking_b.py" --profile rankB_deliver_v090 --allow-offline-two-pass \
-  "${COMMON[@]}" --work-dir "$WORK_DIR/main" --out "$WORK_DIR/submission_main.csv" \
+  "${COMMON[@]}" --work-dir "$WORK_DIR/main" --out "$WORK_DIR/submission.csv" \
   | tee "$WORK_DIR/preflight_main.log" | tail -3
 grep -q "BLOCK=0" "$WORK_DIR/preflight_main.log" \
   || die "pre-flight reported a BLOCK; see $WORK_DIR/preflight_main.log. Nothing was run."
@@ -233,21 +237,21 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 say "8/8  Inference"
-echo "This takes roughly 4-5 hours for 75 sequences on a single A10, plus about half"
-echo "that again for the alternate file. Progress is printed per sequence."
+echo "This takes roughly 4-5 hours for 75 sequences on a single A10. Progress is printed"
+echo "per sequence."
 "$PY1" "$SRC/run_ranking_b.py" --profile rankB_deliver_v090 --allow-offline-two-pass \
-  "${COMMON[@]}" --work-dir "$WORK_DIR/main" --out "$WORK_DIR/submission_main.csv" --execute
-[ -s "$WORK_DIR/submission_main.csv" ] || die "submission_main.csv was not produced"
+  "${COMMON[@]}" --work-dir "$WORK_DIR/main" --out "$WORK_DIR/submission.csv" --execute
+[ -s "$WORK_DIR/submission.csv" ] || die "submission.csv was not produced"
 
-if [ "$SKIP_ONEPASS" = 0 ]; then
+if [ "$WITH_ONEPASS" = 1 ]; then
   "$PY1" "$SRC/run_ranking_b.py" --profile rankB_robust \
     "${COMMON[@]}" --work-dir "$WORK_DIR/onepass" --out "$WORK_DIR/submission_onepass.csv" --execute
   [ -s "$WORK_DIR/submission_onepass.csv" ] || die "submission_onepass.csv was not produced"
 fi
 
 say "Done"
-echo "  primary : $WORK_DIR/submission_main.csv"
-[ "$SKIP_ONEPASS" = 0 ] && echo "  alternate: $WORK_DIR/submission_onepass.csv"
+echo "  $WORK_DIR/submission.csv"
+[ "$WITH_ONEPASS" = 1 ] && echo "  $WORK_DIR/submission_onepass.csv   (alternate, README section 5)"
 echo
-echo "Both files carry one row per frame in the Ranking A sample_submission.csv format."
-echo "See README.md section 5 for what distinguishes the two."
+echo "One row per frame, in the format of the official sample_submission.csv."
+true
