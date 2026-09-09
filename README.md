@@ -291,8 +291,16 @@ about the one place where our post-processing is not literally identical across 
 Our reading is that this is a dataset-level attribute rather than per-sequence tuning: the three
 modalities are distinct sensors with 16/25/15 bands, the official distribution encodes the label
 in the folder name, and the same fixed weights are applied to every sequence of a given modality.
-No component reads the identity of an *individual* sequence, and there is no per-sequence
-constant or lookup table anywhere in the pipeline.
+No component of the submission pipeline — `run_ranking_b.py`, `track_t1.py`,
+`finalize_submission.py`, `run_ensemble_medoid.py` and the `hsot/` and `prep/` modules they
+import — reads the identity of an *individual* sequence, and none contains a per-sequence
+constant or lookup table.
+
+For completeness: the repository also carries development probes that the pipeline never
+imports (for example `3_src/hsot/crop_gap_probe.py`, `3_src/hsot/firstframe_crop_probe.py`).
+Some of those do contain sequence lists, recording which sequences a past diagnostic examined.
+They are kept for provenance; `grep -rl crop_gap_probe 3_src --include='*.py'` shows nothing on
+the execution path imports them.
 
 If you nevertheless consider the modality gate to be outside Protocol 3, two fallbacks are
 already in this package and need no code change:
