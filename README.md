@@ -49,15 +49,14 @@ rather drive the stages yourself.
 | `3_src/configs/ranking_profiles.json` | Every setting of every profile. Nothing is hard-coded outside this file. |
 | `3_src/requirements-rankingb.txt` | Dependency notes, weight URLs and SHA-256 hashes. |
 | `3_src/env_locks/` | Fully resolved package locks from the machines the results were produced on. |
-| `setup_and_run.sh` | One-command setup and run (see Quick start above). |
 | `SAM_LICENSE.txt` | Meta's SAM License, redistributed with the `sam3.pt` checkpoint as that licence requires (§3). |
 
 ---
 
 ## 1. Which command produces which file
 
-Both files come from the **same entry point**; they differ only by `--profile`
-(and by one explicit flag, see the note).
+Everything runs through the **same entry point**, `3_src/run_ranking_b.py`; what changes is
+`--profile` (and one explicit flag, see the note). `setup_and_run.sh` wraps these calls.
 
 ### `submission.csv` — our submission
 
@@ -93,8 +92,9 @@ python 3_src/run_ranking_b.py \
     --execute
 ```
 
-This profile is `profile_intent=disabled`, so it does **not** take `--allow-offline-two-pass`
-and never enters the two-pass path.
+This profile is `profile_intent=disabled`. Do **not** pass `--allow-offline-two-pass` with it:
+that flag turns the crop stage on for any profile, which would silently make this file two-pass
+and remove the only reason it exists. Pre-flight refuses the combination with a `BLOCK`.
 
 ### Dry run first (recommended)
 

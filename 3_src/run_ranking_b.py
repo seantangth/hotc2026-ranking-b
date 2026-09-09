@@ -657,11 +657,16 @@ def preflight(
     if intent == "enabled" and not allow_offline_two_pass:
         add("BLOCK", "offline-two-pass-gate",
             f"{profile_name} 的 profile intent=enabled，但未顯式傳 --allow-offline-two-pass")
+    elif intent == "disabled" and allow_offline_two_pass:
+        # 09-10：這裡原本只是 WARN，但實測旗標會把 crop 打開（計畫 5 步 → 13 步）
+        # ⇒ 「嚴格因果的對照檔」會靜默變成兩趟版本，而那正是它存在的唯一理由。
+        # 交付給主辦方時，順手帶上旗標是完全可能的（主檔就要帶）⇒ 改成 fail-closed。
+        add("BLOCK", "offline-two-pass-gate",
+            f"{profile_name} 的 profile intent=disabled（嚴格單趟因果），"
+            "不可與 --allow-offline-two-pass 併用——該旗標會啟用 crop 兩趟路徑，"
+            "使這個 profile 失去它唯一的用途。要兩趟請改用 rankB_deliver_v090。")
     elif allow_offline_two_pass:
-        detail = "已顯式授權；會使用完整未來預測軌跡回套重跑"
-        if intent == "disabled":
-            detail += "（覆寫 rankB_robust 的因果預設）"
-        add("WARN", "offline-two-pass-gate", detail)
+        add("WARN", "offline-two-pass-gate", "已顯式授權；會使用完整未來預測軌跡回套重跑")
     else:
         add("OK", "offline-two-pass-gate", "未啟用；維持因果 full-frame 管線")
 

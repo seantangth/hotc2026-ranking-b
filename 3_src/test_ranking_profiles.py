@@ -617,3 +617,24 @@ def test_preflight_blocks_when_no_sequence_has_modality_prefix(tmp_path):
 def test_preflight_warns_on_partial_prefix_and_ok_on_full(tmp_path):
     assert _prefix_finding(tmp_path / "partial", ["nir-a", "cardpigs1"]).level == "WARN"
     assert _prefix_finding(tmp_path / "full", ["nir-a", "rednir-b", "vis-c"]).level == "OK"
+
+
+def test_causal_profile_refuses_the_two_pass_flag(tmp_path):
+    """rankB_robust ＋ --allow-offline-two-pass 會真的打開 crop（實測計畫 5 步→13 步），
+    那會讓「嚴格因果對照檔」靜默變成兩趟版本 ⇒ 必須 BLOCK，不能只是 WARN。"""
+    import run_ranking_b as rb
+    fr = _frames_root(tmp_path, "nir-a", 3, "10,10,20,15\n")
+    sample = _write_sample(tmp_path, [f"nir-a_{i}" for i in range(1, 4)])
+    prof = rb.load_profiles()["profiles"]["rankB_robust"]
+    common = dict(frames_root=fr, sample=sample, work_dir=tmp_path / "w", out=tmp_path / "o.csv",
+                  sam3_python=Path("/nonexistent"), samurai_python=Path("/nonexistent"),
+                  sam3_ckpt=Path("/nonexistent"), samurai_dir=Path("/nonexistent"),
+                  samurai_ckpt=Path("/nonexistent"), qhead_weights=Path("/nonexistent"),
+                  selector_weights=Path("/nonexistent"), execute=False, resume_existing_work=False)
+    gate = next(f for f in rb.preflight("rankB_robust", prof, allow_offline_two_pass=True, **common)
+                if f.check == "offline-two-pass-gate")
+    assert gate.level == "BLOCK" and "rankB_deliver_v090" in gate.detail, gate.detail
+    # 不帶旗標時同一條檢查應為 OK（維持因果管線），不得是 WARN/BLOCK
+    ok = next(f for f in rb.preflight("rankB_robust", prof, allow_offline_two_pass=False, **common)
+              if f.check == "offline-two-pass-gate")
+    assert ok.level == "OK", ok.detail
