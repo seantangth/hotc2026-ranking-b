@@ -12,7 +12,7 @@ On a Linux machine with one NVIDIA GPU (16 GB or more) and a CUDA 12 driver:
 ```bash
 git clone https://github.com/seantangth/hotc2026-ranking-b.git
 cd hotc2026-ranking-b
-bash setup_and_run.sh --ranking-dir /path/to/ranking --dry-run   # a few minutes
+bash setup_and_run.sh --ranking-dir /path/to/ranking --dry-run   # setup + checks only
 bash setup_and_run.sh --ranking-dir /path/to/ranking             # 4-5 h for 75 sequences
 ```
 
@@ -27,12 +27,16 @@ folder layout, runs the pre-flight checks and then produces:
 | `submission_onepass.csv` | `rankB_robust` | Strictly causal alternate, see §5. |
 
 Run `--dry-run` first: it does the whole setup and every fail-closed check, then stops before
-inference, so a problem surfaces in minutes rather than hours. Every step is also documented
-as a standalone command below, in case you would rather drive the stages yourself.
+inference, so any problem surfaces immediately rather than hours in. It took **2 min 35 s** on a
+cloud A10 (dominated by ~4.3 GB of checkpoint downloads and two `torch` installs, so allow longer
+on a slower link). Every step is also documented as a standalone command below, in case you would
+rather drive the stages yourself.
 
-> Verified on 2026-09-08: unpacked on a clean cloud GPU machine, run end-to-end on the 75
-> sample ranking sequences released on 7 September, starting from the official folder layout.
-> The main chain finished in 4 h 04 min on one NVIDIA A10 with no manual intervention.
+> **Verified end to end.** 2026-09-08: run on a clean cloud GPU machine over the 75 sample ranking
+> sequences released on 7 September, starting from the official folder layout — the main chain
+> finished in 4 h 04 min on one NVIDIA A10 with no manual intervention.
+> 2026-09-09: the Quick start above was re-run verbatim from a fresh `git clone` of this
+> repository on a new machine, through to `BLOCK=0`, in 2 min 35 s.
 
 ---
 
