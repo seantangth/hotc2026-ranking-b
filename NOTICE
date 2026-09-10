@@ -8,8 +8,7 @@ their own terms. See "Third-party components and licences" in README.md
 for the full list. In particular:
 
   - SAM 3 (facebookresearch/sam3) and the sam3.pt checkpoint are distributed
-    under Meta's custom "SAM License", which is not an OSI-approved licence and
-    contains use restrictions. The sam3.pt checkpoint is supplied with this
+    under Meta's "SAM License". The sam3.pt checkpoint is supplied with this
     submission unmodified, accompanied by a copy of the SAM License
     (SAM_LICENSE.txt) as its section 1.b.i requires.
   - SAMURAI (yangchris11/samurai) and SAM 2.1 are Apache-2.0.

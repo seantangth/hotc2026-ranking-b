@@ -9,9 +9,8 @@
 #
 #   <work-dir>/submission.csv           profile rankB_deliver_v090
 #
-# That single file is our submission. A strictly causal one-pass alternate is available
-# with --with-onepass, for the reason explained in README section 5; it is not produced
-# by default because the file above is the one we are submitting.
+# That single file is our submission. A single-pass variant can additionally be
+# produced with --with-onepass.
 #
 # Every step is fail-closed: a bad checkpoint hash, a mismatched sequence count
 # or a failed pre-flight check stops the script rather than producing a wrong file.
@@ -56,8 +55,8 @@ Options
   --samurai-ckpt PATH  Use an existing sam2.1_hiera_large.pt.
   --dry-run            Set everything up and run the pre-flight checks, then stop
                        before inference. Use this first; it takes a few minutes.
-  --with-onepass       Additionally produce submission_onepass.csv, the strictly causal
-                       one-pass alternate described in README section 5.
+  --with-onepass       Additionally produce submission_onepass.csv, the single-pass
+                       variant (profile rankB_robust).
   -h, --help           This message.
 USAGE
 }
